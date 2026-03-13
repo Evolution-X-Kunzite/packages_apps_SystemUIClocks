@@ -90,6 +90,18 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
     fun lineWidth(view: SimpleDigitalClockTextView): Int =
         view.textBounds.width() + 2 * view.lockScreenPaint.strokeWidth.toInt()
 
+    /** Widest a line may be: the screen minus the keyguard's clock padding on both sides. */
+    private fun maxLineWidth(): Int =
+        context.resources.displayMetrics.widthPixels -
+            2 * context.resources.getDimensionPixelSize(clocksR.dimen.clock_padding_start)
+
+    /** Scale (<= 1) that makes a line fit the screen; long Portuguese minutes get shrunk. */
+    fun lineScale(view: SimpleDigitalClockTextView): Float {
+        val width = lineWidth(view)
+        val max = maxLineWidth()
+        return if (width > max && width > 0) max.toFloat() / width else 1f
+    }
+
     /** Distance between consecutive baselines, relative to the hour line's font size. */
     fun linePitch(): Int = (hourView.lockScreenPaint.textSize * LINE_PITCH).roundToInt()
 
@@ -125,7 +137,7 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
         if (!isReady) return null
         // Measure the lines first (the base class only measures children when it lays out itself).
         for (line in lines) line.measure(MeasureSpec.UNSPECIFIED, MeasureSpec.UNSPECIFIED)
-        return Point(lines.maxOf { lineWidth(it) }, stackHeight() + bottomGap)
+        return Point(lines.maxOf { (lineWidth(it) * lineScale(it)).roundToInt() }, stackHeight() + bottomGap)
     }
 
     override fun refreshTime() {
@@ -133,11 +145,14 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
         if (!isReady) return
         val now = Calendar.getInstance()
         val is24Hour = DateFormat.is24HourFormat(context)
+        // Words follow the system language (Portuguese when it is "pt", English otherwise).
+        val locale = context.resources.configuration.locales[0]
+        val hourOfDay = now.get(Calendar.HOUR_OF_DAY)
         val words =
             listOfNotNull(
-                prefixView?.let { TimeWords.PREFIX },
-                TimeWords.hour(now.get(Calendar.HOUR_OF_DAY), is24Hour),
-                TimeWords.minute(now.get(Calendar.MINUTE)),
+                prefixView?.let { TimeWords.prefix(hourOfDay, is24Hour, locale) },
+                TimeWords.hour(hourOfDay, is24Hour, locale),
+                TimeWords.minute(now.get(Calendar.MINUTE), locale),
             )
         // The digital-hand layers have just written their digits ("02", "46") into these views on
         // this same tick; always put the words back, but only relayout when the words changed.
@@ -159,9 +174,15 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
         super.onDraw(canvas)
         if (!isReady) return
         val tops = lineTops()
+        val baselines = lineBaselines()
         for (i in lines.indices) {
             canvas.saveBlock().use {
                 canvas.translate(0f, tops[i].toFloat())
+                val scale = lineScale(lines[i])
+                if (scale < 1f) {
+                    // Shrink around the line's start and baseline so it stays aligned with the others.
+                    canvas.scale(scale, scale, 0f, (baselines[i] - tops[i]).toFloat())
+                }
                 lines[i].draw(canvas)
             }
         }
