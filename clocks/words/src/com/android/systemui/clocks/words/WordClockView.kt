@@ -18,6 +18,7 @@ import android.text.format.DateFormat
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import com.android.systemui.animation.TextAnimator
 import com.android.systemui.clocks.AssetLoader
 import com.android.systemui.clocks.DigitalClockFaceView
 import com.android.systemui.clocks.HorizontalAlignment
@@ -44,14 +45,31 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
     // row instead of shrinking it (burn-in protection stays on for everything else).
     override val useAlternateSmartspaceAODTransition = true
 
+    // [3-line] Needed to build the extra line and to style it like the design's lines.
+    private val tailBuffer: MessageBuffer = messageBuffer
+    protected abstract val tailAssets: AssetLoader
+
+    // [3-line] When true, compound Portuguese minutes ("E trinta e dois") are split over two lines
+    // ("E trinta" / "e dois"), so the stack is narrower and the smartspace fits beside it.
+    protected open val splitMinutes: Boolean = false
+
     var prefixView: SimpleDigitalClockTextView? = null
         private set
     lateinit var hourView: SimpleDigitalClockTextView
     lateinit var minuteView: SimpleDigitalClockTextView
     private var lastWords: List<String> = emptyList()
 
+    // [3-line] Extra line holding the second half of a split minute. Not supplied by the design:
+    // created once, on demand, and kept attached (it is registered in digitalClockTextViewMap by
+    // the base class, so theme / doze / font changes reach it). It only takes part in drawing and
+    // measuring while tailText != null.
+    private var minuteTailView: SimpleDigitalClockTextView? = null
+    private var tailText: String? = null
+    private var tailSyncedSize = -1f
+    private var tailDozeApplied = false
+
     val lines: List<SimpleDigitalClockTextView>
-        get() = listOfNotNull(prefixView, hourView, minuteView)
+        get() = listOfNotNull(prefixView, hourView, minuteView, minuteTailView.takeIf { tailText != null })
 
     val isReady: Boolean
         get() = this::hourView.isInitialized && this::minuteView.isInitialized
@@ -103,7 +121,12 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
     }
 
     /** Distance between consecutive baselines, relative to the hour line's font size. */
-    fun linePitch(): Int = (hourView.lockScreenPaint.textSize * LINE_PITCH).roundToInt()
+    // [3-line] Tighter pitch when the minutes use two lines so the taller stack does not push the
+    // media card down as much.
+    fun linePitch(): Int {
+        val pitch = if (tailText != null) LINE_PITCH_SPLIT else LINE_PITCH
+        return (hourView.lockScreenPaint.textSize * pitch).roundToInt()
+    }
 
     /**
      * Baseline of each line: the font's ascent for the first, then [linePitch] per line. Taken from
@@ -135,8 +158,11 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
 
     override fun calculateSize(widthMeasureSpec: Int, heightMeasureSpec: Int): Point? {
         if (!isReady) return null
+        // [3-line] Font size may have changed since the tail was styled.
+        if (tailText != null) syncTailStyle()
         // Measure the lines first (the base class only measures children when it lays out itself).
         for (line in lines) line.measure(MeasureSpec.UNSPECIFIED, MeasureSpec.UNSPECIFIED)
+        syncTailDoze() // [3-line] needs the animators, which exist only after the first measure
         return Point(lines.maxOf { (lineWidth(it) * lineScale(it)).roundToInt() }, stackHeight() + bottomGap)
     }
 
@@ -148,11 +174,19 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
         // Words follow the system language (Portuguese when it is "pt", English otherwise).
         val locale = context.resources.configuration.locales[0]
         val hourOfDay = now.get(Calendar.HOUR_OF_DAY)
+        // [3-line] Minutes may come as 2 parts; the 2nd one goes to the extra tail line. If the
+        // tail line cannot be set up (styles not ready), the minutes stay on a single line.
+        val parts =
+            TimeWords.minuteLines(now.get(Calendar.MINUTE), locale).let {
+                if (splitMinutes) it else listOf(it.joinToString(" "))
+            }
+        val minuteParts = if (updateTail(parts.getOrNull(1))) parts else listOf(parts.joinToString(" "))
         val words =
             listOfNotNull(
                 prefixView?.let { TimeWords.prefix(hourOfDay, is24Hour, locale) },
                 TimeWords.hour(hourOfDay, is24Hour, locale),
-                TimeWords.minute(now.get(Calendar.MINUTE), locale),
+                minuteParts[0],
+                minuteParts.getOrNull(1),
             )
         // The digital-hand layers have just written their digits ("02", "46") into these views on
         // this same tick; always put the words back, but only relayout when the words changed.
@@ -162,6 +196,71 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
         contentDescription = words.joinToString(" ")
         requestLayout()
         invalidate()
+    }
+
+    // [3-line] Whether the design's minute layer already has its styles (applyStyles ran).
+    private fun minuteStyled(): Boolean =
+        runCatching { minuteView.textStyle.let { } ; minuteView.aodStyle.let { } }.isSuccess
+
+    /**
+     * [3-line] Turns the tail line on (text != null) or off. Returns false when it was asked to be
+     * on but could not be set up; the caller then keeps the minutes on one line.
+     */
+    private fun updateTail(text: String?): Boolean {
+        if (text == null) {
+            tailText = null
+            return true
+        }
+        if (minuteTailView == null) {
+            if (!minuteStyled()) {
+                tailText = null
+                return false
+            }
+            minuteTailView =
+                SimpleDigitalClockTextView(context, tailBuffer).also {
+                    it.id = View.generateViewId()
+                    addView(it) // onViewAdded: same layout params / alignment, and registers it in the map
+                }
+        }
+        if (!syncTailStyle()) {
+            tailText = null
+            return false
+        }
+        tailText = text
+        return true
+    }
+
+    /**
+     * The design only styles its own layers, so style the tail the same way they were styled:
+     * same text/AOD style objects, same font size. Returns false if that failed.
+     */
+    private fun syncTailStyle(): Boolean {
+        val tail = minuteTailView ?: return false
+        val size = minuteView.lockScreenPaint.textSize
+        if (size == tailSyncedSize) return true
+        return runCatching {
+            if (tailSyncedSize < 0f) {
+                tail.applyStyles(tailAssets, minuteView.textStyle, minuteView.aodStyle)
+                // updateColors() needs a ThemeConfig we don't have here; copy the resolved color.
+                // The next theme change goes through the base class and sets everything properly.
+                tail.lockScreenPaint.color = minuteView.lockScreenPaint.color
+            }
+            // applyTextSize multiplies by fontSizeScale; minuteView's paint already includes it.
+            tail.applyTextSize(size / (minuteView.textStyle.fontSizeScale ?: 1f))
+            tailSyncedSize = size
+        }.isSuccess
+    }
+
+    /** Puts the tail in the same (doze / awake) state as the minute line, once its animators exist. */
+    private fun syncTailDoze() {
+        val tail = minuteTailView ?: return
+        if (tailDozeApplied || tail.animators == null) return
+        tail.dozeFraction = minuteView.dozeFraction
+        if (minuteView.dozeFraction < 1f) {
+            tail.animators?.textAnimator?.setTextStyle(TextAnimator.Style(color = tail.lockScreenPaint.color))
+        }
+        tail.animateDoze(minuteView.dozeFraction > 0f, false)
+        tailDozeApplied = true
     }
 
     private fun setLine(view: SimpleDigitalClockTextView, text: String) {
@@ -190,6 +289,7 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
 
     companion object {
         const val LINE_PITCH = 1.25f
+        const val LINE_PITCH_SPLIT = 1.1f // [3-line]
         const val DATE_GAP_DP = 20f
     }
 }
@@ -203,11 +303,20 @@ abstract class WordClockViewBase(context: Context, messageBuffer: MessageBuffer)
  * with the size transition that the same notification triggers.
  */
 class WordClockViewLarge(context: Context, val assets: AssetLoader, messageBuffer: MessageBuffer) :
-    WordClockViewBase(context, messageBuffer)
+    WordClockViewBase(context, messageBuffer) {
+    override val tailAssets: AssetLoader
+        get() = assets
+}
 
 /** Small (collapsed) face: hour / minute at the top of the small clock slot, tinted by the design. */
 class WordClockViewSmall(context: Context, val assets: AssetLoader, messageBuffer: MessageBuffer) :
     WordClockViewBase(context, messageBuffer) {
+    override val tailAssets: AssetLoader
+        get() = assets
+
+    // [3-line] Compact mode: "Dezessete / E trinta / e dois" instead of 2 wide lines.
+    override val splitMinutes = true
+
     /** The words keep the large face's size when notifications push the clock into the small slot. */
     override fun onFontSettingChanged(fontSizePx: Float) =
         super.onFontSettingChanged(context.resources.getDimensionPixelSize(clocksR.dimen.large_clock_text_size).toFloat())

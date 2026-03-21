@@ -94,4 +94,18 @@ object TimeWords {
                 else -> numberEn(minute)
             }
         }
+
+    /**
+     * Minutes split into up to two display lines, so the small face can use 3 lines in total.
+     * Portuguese compound numbers break at the inner " e ": "E trinta e dois" becomes
+     * ["E trinta", "e dois"]. Simple numbers ("E vinte", "E quinze"), "Em ponto" and English stay
+     * on one line.
+     */
+    fun minuteLines(minute: Int, locale: Locale = Locale.getDefault()): List<String> {
+        val full = minute(minute, locale)
+        if (!isPt(locale)) return listOf(full)
+        // Skip the leading "E " so only the inner connector is considered.
+        val i = full.indexOf(" e ", startIndex = 2)
+        return if (i > 0) listOf(full.substring(0, i), full.substring(i + 1)) else listOf(full)
+    }
 }
